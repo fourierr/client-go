@@ -23,13 +23,20 @@ import (
 	"k8s.io/utils/clock"
 )
 
+// 通用FIFO 队列
 type Interface interface {
+	// 为队列添添加一个元素
 	Add(item interface{})
+	// 获取队列长度
 	Len() int
+	// 从头部获取一个元素
 	Get() (item interface{}, shutdown bool)
+	// 标记一个元素处理完成
 	Done(item interface{})
+	// 关闭队列
 	ShutDown()
 	ShutDownWithDrain()
+	// 获取队列是否正在关闭
 	ShuttingDown() bool
 }
 
@@ -69,19 +76,24 @@ func newQueue(c clock.WithTicker, metrics queueMetrics, updatePeriod time.Durati
 const defaultUnfinishedWorkUpdatePeriod = 500 * time.Millisecond
 
 // Type is a work queue (see the package comment).
+// 具体queue的实现
 type Type struct {
 	// queue defines the order in which we will work on items. Every
 	// element of queue should be in the dirty set and not in the
 	// processing set.
+	// 存储具体元素，类型为slice
 	queue []t
 
 	// dirty defines all of the items that need to be processed.
+	// 定义所有的元素被处理，是以map类型，可以对元素去重
 	dirty set
 
 	// Things that are currently being processed are in the processing set.
 	// These things may be simultaneously in the dirty set. When we finish
 	// processing something and remove it from this set, we'll check if
 	// it's in the dirty set, and if so, add it to the queue.
+	// 标记元素是否正在处理。
+	// 有些元素可能同时存在processing和dirty中，当处理完这个元素，从集合删除的时候，如果发现元素还在dirty集合中，在此将其添加至queue队尾
 	processing set
 
 	cond *sync.Cond
@@ -97,6 +109,8 @@ type Type struct {
 
 type empty struct{}
 type t interface{}
+
+// set 集合，用 map 来模拟 set 集合（元素不重复），更快效率的查找元素
 type set map[t]empty
 
 func (s set) has(item t) bool {
@@ -120,21 +134,25 @@ func (s set) len() int {
 func (q *Type) Add(item interface{}) {
 	q.cond.L.Lock()
 	defer q.cond.L.Unlock()
+	// 如果队列已经关闭则直接返回
 	if q.shuttingDown {
 		return
 	}
+	// 如果dirty中已经有该元素，则直接返回，目的是实现去重
 	if q.dirty.has(item) {
 		return
 	}
 
 	q.metrics.add(item)
-
+	// 添加元素到dirty中
 	q.dirty.insert(item)
+	// 如果元素正在处理，则直接返回
 	if q.processing.has(item) {
 		return
 	}
-
+	// 添加元素到queue中
 	q.queue = append(q.queue, item)
+	// 通知其他协程接触阻塞
 	q.cond.Signal()
 }
 
@@ -153,9 +171,11 @@ func (q *Type) Len() int {
 func (q *Type) Get() (item interface{}, shutdown bool) {
 	q.cond.L.Lock()
 	defer q.cond.L.Unlock()
+	// 如果队列为关闭，且队列长度为0，则进行阻塞，待元素添加进队列发送解除阻塞通知执行
 	for len(q.queue) == 0 && !q.shuttingDown {
 		q.cond.Wait()
 	}
+	// 如果队列长度为0，则关闭队列
 	if len(q.queue) == 0 {
 		// We must be shutting down.
 		return nil, true
@@ -163,12 +183,14 @@ func (q *Type) Get() (item interface{}, shutdown bool) {
 
 	item = q.queue[0]
 	// The underlying array still exists and reference this object, so the object will not be garbage collected.
+	// 从队列头部弹出第一个元素
 	q.queue[0] = nil
 	q.queue = q.queue[1:]
 
 	q.metrics.get(item)
-
+	// 将元素插入到processing中，标记为正在处理
 	q.processing.insert(item)
+	// 从dirty中删除队列
 	q.dirty.delete(item)
 
 	return item, false
@@ -182,8 +204,9 @@ func (q *Type) Done(item interface{}) {
 	defer q.cond.L.Unlock()
 
 	q.metrics.done(item)
-
+	// 将processing中的元素移除
 	q.processing.delete(item)
+	// 判断元素是否还在dirty中，如果在则将其重新添加至queue队尾
 	if q.dirty.has(item) {
 		q.queue = append(q.queue, item)
 		q.cond.Signal()

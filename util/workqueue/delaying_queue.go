@@ -30,6 +30,7 @@ import (
 type DelayingInterface interface {
 	Interface
 	// AddAfter adds an item to the workqueue after the indicated duration has passed
+	// 在此刻过duration时间后再加入到queue中
 	AddAfter(item interface{}, duration time.Duration)
 }
 
@@ -72,6 +73,7 @@ func newDelayingQueue(clock clock.WithTicker, q Interface, name string) *delayin
 }
 
 // delayingType wraps an Interface and provides delayed re-enquing
+// 延迟队列的实现为delayingType，其继承了通用接口，在其基础上主要新增了waitingForAddCh字段，来实现延迟的功能
 type delayingType struct {
 	Interface
 
@@ -81,19 +83,24 @@ type delayingType struct {
 	// stopCh lets us signal a shutdown to the waiting loop
 	stopCh chan struct{}
 	// stopOnce guarantees we only signal shutdown a single time
+	//保证仅仅发送一次关闭信号
 	stopOnce sync.Once
 
 	// heartbeat ensures we wait no more than maxWait before firing
+	// 在触发之前确保等待的时间不超过maxWait
 	heartbeat clock.Ticker
 
 	// waitingForAddCh is a buffered channel that feeds waitingForAdd
+	// waitingForAddCh是一个缓冲channel
 	waitingForAddCh chan *waitFor
 
 	// metrics counts the number of retries
+	// 记录重试次数
 	metrics retryMetrics
 }
 
 // waitFor holds the data to add and the time it should be added
+// 保存了包括数据`data`和该`item`什么时间起(`readyAt`)就可以进入队列了.
 type waitFor struct {
 	data    t
 	readyAt time.Time
@@ -109,6 +116,8 @@ type waitFor struct {
 // it has been removed from the queue and placed at index Len()-1 by
 // container/heap. Push adds an item at index Len(), and container/heap
 // percolates it into the correct location.
+// waitForPriorityQueue 为 waitFor 项目实现优先级队列
+// 是用于保存`waitFor`的优先队列, 按`readyAt`时间从早到晚排序. 先`ready`的`item`先出队列.
 type waitForPriorityQueue []*waitFor
 
 func (pq waitForPriorityQueue) Len() int {
@@ -168,6 +177,7 @@ func (q *delayingType) AddAfter(item interface{}, duration time.Duration) {
 	q.metrics.retry()
 
 	// immediately add things with no delay
+	// 如果传入的时间小于等于0则立即添加
 	if duration <= 0 {
 		q.Add(item)
 		return
@@ -176,6 +186,7 @@ func (q *delayingType) AddAfter(item interface{}, duration time.Duration) {
 	select {
 	case <-q.stopCh:
 		// unblock if ShutDown() is called
+		// 构造一个waitFor对象传入到waitingForAddCh通道中
 	case q.waitingForAddCh <- &waitFor{data: item, readyAt: q.clock.Now().Add(duration)}:
 	}
 }
@@ -186,18 +197,22 @@ func (q *delayingType) AddAfter(item interface{}, duration time.Duration) {
 const maxWait = 10 * time.Second
 
 // waitingLoop runs until the workqueue is shutdown and keeps a check on the list of items to be added.
+// waitingLoop 方法一直运行到工作队列关闭，并检查要添加的项目列表，利用channel(q.waitingForAddCh)一直接受从AddAfter过来的waitFor，
+// 将已经ready的item添加到队列中。
 func (q *delayingType) waitingLoop() {
 	defer utilruntime.HandleCrash()
 
 	// Make a placeholder channel to use when there are no items in our list
+	// // 创建一个占位channel，当list没有元素的时候，利用其实现等待
 	never := make(<-chan time.Time)
 
 	// Make a timer that expires when the item at the head of the waiting queue is ready
+	// 构造一个定时器，当等待队列头部的元素准备好后，该定时器失效
 	var nextReadyAtTimer clock.Timer
 
 	waitingForQueue := &waitForPriorityQueue{}
 	heap.Init(waitingForQueue)
-
+	// 利用map实现去重，如果在此添加相同元素，仅实现更新时间
 	waitingEntryByData := map[t]*waitFor{}
 
 	for {
@@ -208,24 +223,31 @@ func (q *delayingType) waitingLoop() {
 		now := q.clock.Now()
 
 		// Add ready entries
+		// 如果优先队列有元素
 		for waitingForQueue.Len() > 0 {
 			entry := waitingForQueue.Peek().(*waitFor)
+			// 如果队列头部的元素时间已经大于现在时间，则表明整个优先级队列中的元素都大于当前时间，还没到插入元素的时间，则直接break
+			// 第一个元素时间是最小的
 			if entry.readyAt.After(now) {
 				break
 			}
-
+			// 否则说明以及改到了插入数据时间了，执行插入到通用队列中
 			entry = heap.Pop(waitingForQueue).(*waitFor)
 			q.Add(entry.data)
+			// 并从优先级队列删除
 			delete(waitingEntryByData, entry.data)
 		}
-
+		// 当优先级队列中没有元素，则在后面进行等待
 		// Set up a wait for the first item's readyAt (if one exists)
 		nextReadyAt := never
+		// 如果优先级队列中有元素
 		if waitingForQueue.Len() > 0 {
 			if nextReadyAtTimer != nil {
 				nextReadyAtTimer.Stop()
 			}
+			// 获取第一个元素
 			entry := waitingForQueue.Peek().(*waitFor)
+			// 构造一个nextReady时间等待器
 			nextReadyAtTimer = q.clock.NewTimer(entry.readyAt.Sub(now))
 			nextReadyAt = nextReadyAtTimer.C()
 		}
@@ -233,20 +255,22 @@ func (q *delayingType) waitingLoop() {
 		select {
 		case <-q.stopCh:
 			return
-
+			// 定时器，如果过一段时间在没有任何数据，则进行一次大循环
 		case <-q.heartbeat.C():
 			// continue the loop, which will add ready items
 
 		case <-nextReadyAt:
 			// continue the loop, which will add ready items
-
+			//addAfter放入的元素从该处获取
 		case waitEntry := <-q.waitingForAddCh:
+			// 如果元素时间大于当前时间，则添加到优先级队列中
 			if waitEntry.readyAt.After(q.clock.Now()) {
 				insert(waitingForQueue, waitingEntryByData, waitEntry)
 			} else {
+				// 如果元素时间大于当前时间，则添加到优先级队列中
 				q.Add(waitEntry.data)
 			}
-
+			// 将channel中的元素全部取出来
 			drained := false
 			for !drained {
 				select {
@@ -265,9 +289,12 @@ func (q *delayingType) waitingLoop() {
 }
 
 // insert adds the entry to the priority queue, or updates the readyAt if it already exists in the queue
+// 添加元素至优先级队列，如果元素相同则进行更新时间
 func insert(q *waitForPriorityQueue, knownEntries map[t]*waitFor, entry *waitFor) {
 	// if the entry already exists, update the time only if it would cause the item to be queued sooner
+	// 判断队列中是否已经存在该元素
 	existing, exists := knownEntries[entry.data]
+	// 如果存则，则直接更新元素
 	if exists {
 		if existing.readyAt.After(entry.readyAt) {
 			existing.readyAt = entry.readyAt
@@ -276,7 +303,7 @@ func insert(q *waitForPriorityQueue, knownEntries map[t]*waitFor, entry *waitFor
 
 		return
 	}
-
+	// 不存在则添加进优先级队列
 	heap.Push(q, entry)
 	knownEntries[entry.data] = entry
 }
