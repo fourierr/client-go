@@ -34,7 +34,7 @@ type RateLimiter interface {
 	// 释放指定元素
 	Forget(item interface{})
 	// NumRequeues returns back how many failures the item has had
-	// 返回某个对象重新入队列次数
+	// 返回某个失败次数
 	NumRequeues(item interface{}) int
 }
 
